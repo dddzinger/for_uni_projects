@@ -10,9 +10,10 @@ import pandas as pd
 CATEGORY_ASTAR = "A*"
 CATEGORY_RINC = "РИНЦ"
 CATEGORY_GREY = "Серая зона"
-CATEGORY_PREPRINT = "Препринт"
+CATEGORY_PREPRINT = "Preprint"
+CATEGORY_CONFERENCE = "Conference"
 CATEGORY_STANDARD = "Стандарт/Спецификация"
-CATEGORY_UNKNOWN = "Неизвестно"
+CATEGORY_UNKNOWN = "Неопределено"
 
 
 def read_json_file(file_path: str) -> Any:
@@ -159,7 +160,7 @@ def parse_rank_schemes(rank_text: str) -> Dict[str, bool]:
                 set_flag(f"abdc_{grade}")
 
     # CORE
-    if any(tok in text for tok in ("core")):
+    if any(tok in text for tok in ("core",)):
         for grade in ("a*", "a", "b", "c"):
             if f"core{grade}" in text or f"core-{grade}" in text or f"core_{grade}" in text:
                 set_flag(f"core_{grade}")
@@ -239,6 +240,87 @@ def classify_row(row: pd.Series, treat_preprints_as_grey: bool = True) -> str:
     return CATEGORY_UNKNOWN
 
 
+def classify_source(row: pd.Series) -> str:
+    """Unified classifier that aligns with the requested categories.
+
+    Categories returned: "A*", "РИНЦ", "Preprint", "Conference", "Серая зона", "Неопределено".
+    """
+    source = str(row.get("Source", "")).lower()
+    url = str(row.get("URL", ""))
+    domain = extract_domain(url)
+
+    # Rank-based A* check: consider multiple schemes
+    rank_text = collect_rank_text(row)
+    rank_flags = parse_rank_schemes(rank_text)
+    rank_simple = normalize_rank(str(row.get("journal_rank", "")))
+
+    if (
+        rank_simple in {"1", "2", "q1", "q2", "a*", "a"}
+        or rank_flags.get("q1")
+        or rank_flags.get("q2")
+        or rank_flags.get("abdc_a*")
+        or rank_flags.get("abdc_a")
+        or rank_flags.get("core_a*")
+        or rank_flags.get("core_a")
+        or rank_flags.get("abs_4*")
+        or rank_flags.get("abs_4")
+    ):
+        return CATEGORY_ASTAR
+
+    # RINC
+    rinc_markers = ("rinc", "ринц", "elibrary", "cyberleninka")
+    if any(m in source for m in rinc_markers) or domain in {"elibrary.ru", "cyberleninka.ru"}:
+        return CATEGORY_RINC
+
+    # Preprints
+    preprint_markers = ("arxiv", "biorxiv", "medrxiv", "chemrxiv", "preprint")
+    if any(m in source for m in preprint_markers) or domain in {"arxiv.org", "biorxiv.org", "medrxiv.org"}:
+        return CATEGORY_PREPRINT
+
+    # Conferences
+    conference_markers = (
+        "conference", "conf.", "proceedings", "workshop", "symposium", "companion",
+        # common CS venues acronyms (heuristic)
+        "neurips", "nips", "icml", "iclr", "kdd", "www ", "thewebconf", "sigmod", "vldb", "icse", "fse",
+        "aaai", "ijcai", "emnlp", "acl", "naacl", "eccv", "cvpr", "iccv"
+    )
+    conf_domains = {"dl.acm.org", "ieeexplore.ieee.org", "aaai.org"}
+    if any(m in source for m in conference_markers) or domain in conf_domains:
+        return CATEGORY_CONFERENCE
+
+    # Grey zone / Internet sources
+    grey_markers = (
+        "internet source", "habr", "medium", "blog", "vc.ru", "substack", "teletype", "github.io",
+        "dev.to", "t.me", "telegram", "researchgate", "stackoverflow", "stack overflow", "reddit",
+        "quora", "wikipedia", "wiki", "blogspot", "wordpress", "vk.com", "youtube.com"
+    )
+    grey_domains = {
+        "habr.com", "medium.com", "vc.ru", "substack.com", "teletype.in", "github.io", "dev.to", "t.me",
+        "telegram.me", "researchgate.net", "stackoverflow.com", "stackexchange.com", "reddit.com", "quora.com",
+        "wikipedia.org", "blogspot.com", "wordpress.com", "vk.com", "youtube.com", "github.com"
+    }
+    if any(m in source for m in grey_markers) or domain in grey_domains:
+        return CATEGORY_GREY
+
+    return CATEGORY_UNKNOWN
+
+
+def evaluate_quality(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["Category"] = df.apply(classify_source, axis=1)
+    stats = (df["Category"].value_counts(normalize=True) * 100).round(2).to_dict()
+
+    print("\n📊 Отчёт по источникам:")
+    for k, v in sorted(stats.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"— {k}: {v:.2f}%")
+
+    print("\n✅ Проверка критериев качества:")
+    print("≥ 50% — A*: ", "OK" if stats.get("A*", 0.0) >= 50 else "FAIL")
+    print("≥ 15% — РИНЦ: ", "OK" if stats.get("РИНЦ", 0.0) >= 15 else "FAIL")
+    print("≤ 10% — Серая зона: ", "OK" if stats.get("Серая зона", 0.0) <= 10 else "FAIL")
+    return df
+
+
 def compute_stats(categories: pd.Series) -> Dict[str, float]:
     if categories.empty:
         return {}
@@ -279,35 +361,27 @@ def write_excel(df: pd.DataFrame, stats: Dict[str, float], output_path: str) -> 
         print(f"Не удалось записать Excel ('{output_path}'): {e}")
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Оценка качества списка литературы (часть 3)")
-    parser.add_argument("--input", required=True, help="Путь к JSON-файлу со списком литературы")
-    parser.add_argument("--output", default="bibliography_report.xlsx", help="Путь к Excel-отчёту (xlsx)")
-    parser.add_argument("--a-star-min", type=float, default=50.0, help="Минимальный процент A* (по умолчанию 50)")
-    parser.add_argument("--rinc-min", type=float, default=15.0, help="Минимальный процент РИНЦ (по умолчанию 15)")
-    parser.add_argument("--grey-max", type=float, default=10.0, help="Максимальный процент Серой зоны (по умолчанию 10)")
-    parser.add_argument("--treat-preprints-as-grey", action="store_true", help="Считать arXiv/препринты серой зоной")
-
-    args = parser.parse_args(argv)
-
-    df = load_bibliography(args.input)
+def main_interactive() -> int:
+    file_path = input("Введите путь к JSON-файлу (output.json от коллеги): ").strip()
+    if not file_path:
+        print("Путь не указан.")
+        return 1
+    df = load_bibliography(file_path)
     if df.empty:
         print("Входной список пуст.")
         return 0
 
-    df = df.copy()
-    df["Категория"] = df.apply(lambda row: classify_row(row, treat_preprints_as_grey=args.treat_preprints_as_grey), axis=1)
-    stats = compute_stats(df["Категория"]) or {}
+    df = evaluate_quality(df)
 
-    print_report(stats, a_star_min=args["a_star_min"] if isinstance(args, dict) else args.a_star_min,
-                 rinc_min=args["rinc_min"] if isinstance(args, dict) else args.rinc_min,
-                 grey_max=args["grey_max"] if isinstance(args, dict) else args.grey_max)
-
-    if args.output:
-        write_excel(df, stats, args.output)
+    try:
+        df.to_excel("bibliography_report.xlsx", index=False)
+        print("\n💾 Подробный отчёт сохранён в 'bibliography_report.xlsx'")
+    except Exception:
+        df.to_csv("bibliography_report.csv", index=False)
+        print("\nℹ️ Не удалось сохранить .xlsx, сохранён 'bibliography_report.csv'")
 
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main_interactive())
