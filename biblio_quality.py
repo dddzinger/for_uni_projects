@@ -1,7 +1,7 @@
 import argparse
 import json
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -10,6 +10,8 @@ import pandas as pd
 CATEGORY_ASTAR = "A*"
 CATEGORY_RINC = "РИНЦ"
 CATEGORY_GREY = "Серая зона"
+CATEGORY_PREPRINT = "Препринт"
+CATEGORY_STANDARD = "Стандарт/Спецификация"
 CATEGORY_UNKNOWN = "Неизвестно"
 
 
@@ -55,18 +57,125 @@ def extract_domain(url: str) -> str:
 
 
 def normalize_rank(rank_raw: str) -> str:
+    """Back-compat simple normalization for single-value rank fields.
+
+    Note: richer multi-scheme parsing is in parse_rank_schemes/collect_rank_text.
+    """
     rank = (rank_raw or "").strip().lower()
-    # unify similar encodings
+    # unify common variants
     replacements = {
         "а*": "a*",  # Cyrillic 'a' to Latin
         "q-1": "q1",
         "q-2": "q2",
+        "q-3": "q3",
+        "q-4": "q4",
         "q 1": "q1",
         "q 2": "q2",
+        "q 3": "q3",
+        "q 4": "q4",
+        "quartile 1": "q1",
+        "quartile 2": "q2",
+        "quartile 3": "q3",
+        "quartile 4": "q4",
     }
     for src, dst in replacements.items():
         rank = rank.replace(src, dst)
     return rank
+
+
+def get_values(row: pd.Series, keys: List[str]) -> List[str]:
+    values: List[str] = []
+    for key in keys:
+        if key in row and pd.notna(row[key]):
+            value = str(row[key]).strip()
+            if value and value != "-":
+                values.append(value)
+    return values
+
+
+def collect_rank_text(row: pd.Series) -> str:
+    """Collect all known rank-related fields into a single text blob for parsing."""
+    rank_fields = [
+        # generic
+        "journal_rank",
+        "rank",
+        "quartile",
+        "scopus_quartile",
+        "wos_quartile",
+        "sjr_rank",
+        "snip_rank",
+        # business/management rankings
+        "abdc_rank",
+        "abdc",
+        "core_rank",
+        "core",
+        "abs_rank",
+        "ajg_rank",
+        "cabs_rank",
+        "ajg",
+        "abs",
+        "cabs",
+    ]
+    values = get_values(row, rank_fields)
+    return " | ".join(values).lower()
+
+
+def parse_rank_schemes(rank_text: str) -> Dict[str, bool]:
+    """Parse rank text into boolean flags for multiple schemes.
+
+    Returns a dict with keys like 'q1', 'q2', 'abdc_a', 'core_a*', 'abs_4*', etc.
+    """
+    text = (rank_text or "").lower()
+    # normalize separators and dashes
+    text = (
+        text.replace("−", "-")
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace(" ", "")
+    )
+    # cyrillic 'а' to latin 'a'
+    text = text.replace("а*", "a*")
+
+    flags: Dict[str, bool] = {}
+
+    def set_flag(name: str) -> None:
+        flags[name] = True
+
+    # SJR/Scopus/WoS quartiles
+    for q in ("q1", "q2", "q3", "q4"):
+        if q in text or f"quartile{q[-1]}" in text:
+            set_flag(q)
+
+    # ABDC
+    if any(tok in text for tok in ("abdc",)):
+        if "abdca*" in text or "a*abdc" in text:
+            set_flag("abdc_a*")
+        for grade in ("a*", "a", "b", "c"):
+            if f"abdc{grade}" in text:
+                set_flag(f"abdc_{grade}")
+        # also patterns like 'abdc-a', 'abdc_a'
+        for grade in ("a*", "a", "b", "c"):
+            if f"abdc-{grade}" in text or f"abdc_{grade}" in text:
+                set_flag(f"abdc_{grade}")
+
+    # CORE
+    if any(tok in text for tok in ("core")):
+        for grade in ("a*", "a", "b", "c"):
+            if f"core{grade}" in text or f"core-{grade}" in text or f"core_{grade}" in text:
+                set_flag(f"core_{grade}")
+
+    # ABS/AJG/CABS (CABS/ABS/AJG levels 4*,4,3,2,1)
+    for scheme in ("abs", "ajg", "cabs"):
+        if scheme in text:
+            for level in ("4*", "4", "3", "2", "1"):
+                lvl_norm = level.replace("*", "\u2605")  # prevent accidental partial matches
+                if f"{scheme}{level}" in text or f"{scheme}-{level}" in text or f"{scheme}_{level}" in text:
+                    set_flag(f"abs_{level}")
+                # some datasets may contain unicode star — normalize heuristically
+                if f"{scheme}{lvl_norm}" in text:
+                    set_flag(f"abs_{level}")
+
+    return flags
 
 
 def classify_row(row: pd.Series, treat_preprints_as_grey: bool = True) -> str:
@@ -75,9 +184,9 @@ def classify_row(row: pd.Series, treat_preprints_as_grey: bool = True) -> str:
     ]).lower()
     url = get_first_present(row, ["URL", "url", "Link", "link", "Href", "href"])
     domain = extract_domain(url)
-    rank = normalize_rank(get_first_present(row, [
-        "journal_rank", "rank", "quartile", "scopus_quartile", "wos_quartile", "sjr_rank", "snip_rank"
-    ]))
+    # collect rank info across multiple possible fields
+    rank_text = collect_rank_text(row)
+    rank_flags = parse_rank_schemes(rank_text)
 
     text_blob = " ".join(filter(None, [source, domain, url])).lower()
 
@@ -102,11 +211,29 @@ def classify_row(row: pd.Series, treat_preprints_as_grey: bool = True) -> str:
     if any(marker in text_blob for marker in grey_markers):
         return CATEGORY_GREY
 
-    if treat_preprints_as_grey and any(marker in text_blob for marker in preprint_markers):
-        return CATEGORY_GREY
+    if any(marker in text_blob for marker in preprint_markers):
+        return CATEGORY_GREY if treat_preprints_as_grey else CATEGORY_PREPRINT
 
-    # A* via quartiles/ranks
-    if rank in {"q1", "q2", "a*", "a"}:
+    # Standards / Specifications (authoritative but not peer-reviewed)
+    standard_domains = {
+        "w3.org", "rfc-editor.org", "ietf.org", "iso.org", "ecma-international.org", "itu.int",
+        "whatwg.org", "oasis-open.org", "khronos.org"
+    }
+    standard_markers = ("rfc", "recommendation", "specification", "technicalreport")
+    if domain in standard_domains or any(m in text_blob for m in standard_markers):
+        return CATEGORY_STANDARD
+
+    # A* via quartiles/ranks across multiple schemes
+    if (
+        rank_flags.get("q1")
+        or rank_flags.get("q2")
+        or rank_flags.get("abdc_a*")
+        or rank_flags.get("abdc_a")
+        or rank_flags.get("core_a*")
+        or rank_flags.get("core_a")
+        or rank_flags.get("abs_4*")
+        or rank_flags.get("abs_4")
+    ):
         return CATEGORY_ASTAR
 
     return CATEGORY_UNKNOWN
@@ -124,7 +251,7 @@ def print_report(stats: Dict[str, float], a_star_min: float, rinc_min: float, gr
     if not stats:
         print("— Нет данных для отчёта")
     else:
-        for cat, pct in stats.items():
+        for cat, pct in sorted(stats.items(), key=lambda kv: (-kv[1], kv[0])):
             print(f"— {cat}: {pct:.2f}%")
 
     a_star_pct = stats.get(CATEGORY_ASTAR, 0.0)
